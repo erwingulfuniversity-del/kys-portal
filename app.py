@@ -1,99 +1,88 @@
 import streamlit as st
-import easyocr
-import numpy as np
-import cv2
-from pdf2image import convert_from_path
-from rapidfuzz import fuzz
+from passporteye import read_mrz
+from difflib import SequenceMatcher
+from PIL import Image
 import tempfile
 import os
-import re
 
-# --- Constants for ICAO Doc 9303 (Passport Standard) ---
-PASSPORT_LINE_LEN = 44
-PASSPORT_LINES = 2
+# --- Page Configuration ---
+st.set_page_config(page_title="KYS Student Verifier", page_icon="🛂")
 
-@st.cache_resource
-def load_ocr():
-    return easyocr.Reader(['en'])
+def fuzzy_match(string1, string2):
+    if not string1 or not string2:
+        return 0
+    return SequenceMatcher(None, string1.upper(), string2.upper()).ratio()
 
-reader = load_ocr()
-
-def is_valid_passport_standard(ocr_results):
-    """
-    Checks if the detected text contains a valid TD3 MRZ (Passport Standard).
-    """
-    # Look for lines that look like MRZ (long, mostly caps, numbers, and '<')
-    mrz_lines = [res for res in ocr_results if len(res.replace(" ", "")) >= 40 and '<' in res]
+def verify_logic(file_path, input_name, input_dob, input_country):
+    mrz = read_mrz(file_path)
+    if mrz is None:
+        return False, "Passport MRZ not detected. Please upload a clearer scan.", 0
     
-    if len(mrz_lines) < 2:
-        return False, "Standard Passport MRZ not detected."
-
-    # Standard Passport (TD3) starts with 'P' and has specific lengths
-    top_line = mrz_lines[-2].replace(" ", "")
-    bottom_line = mrz_lines[-1].replace(" ", "")
-
-    if not top_line.startswith('P'):
-        return False, "Document detected is not a Passport (missing 'P' header)."
+    data = mrz.to_dict()
     
-    # Check for typical MRZ character set (A-Z, 0-9, <)
-    if not re.match(r'^[A-Z0-9<]+$', top_line) or not re.match(r'^[A-Z0-9<]+$', bottom_line):
-        return False, "Document contains invalid characters for a standard passport."
+    # Extract data from MRZ
+    p_name = f"{data.get('names', '')} {data.get('surname', '')}"
+    p_dob = data.get('date_of_birth', '')
+    p_country = data.get('country', '')
 
-    return True, "Valid Passport Standard Detected."
+    # Matching Logic
+    name_score = fuzzy_match(input_name, p_name)
+    name_verified = name_score > 0.8
+    dob_verified = (input_dob == p_dob)
+    country_verified = (input_country.upper() == p_country.upper())
 
-def process_document(pdf_file):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
-        tmp.write(pdf_file.getvalue())
-        tmp_path = tmp.name
+    if name_verified and dob_verified and country_verified:
+        return True, "Identity Verified Successfully!", name_score
+    else:
+        errors = []
+        if not name_verified: errors.append("Name mismatch")
+        if not dob_verified: errors.append("DOB mismatch")
+        if not country_verified: errors.append("Country mismatch")
+        return False, f"Verification Failed: {', '.join(errors)}", name_score
 
-    try:
-        images = convert_from_path(tmp_path)
-        img = np.array(images[0])
-        img_bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+# --- UI Layout ---
+st.title("🎓 Student Portal: KYS Verification")
+st.write("Complete your registration by verifying your international passport.")
+
+with st.sidebar:
+    st.header("Help & Instructions")
+    st.info("""
+    - **Name:** Enter full name as on ID.
+    - **DOB:** Must be in **YYMMDD** format (e.g., 950520).
+    - **Country:** 3-letter ISO code (e.g., GBR, USA, IND).
+    """)
+
+# Input Fields
+col1, col2 = st.columns(2)
+with col1:
+    user_name = st.text_input("Full Name")
+    user_dob = st.text_input("Date of Birth (YYMMDD)", help="Example: Jan 20, 1998 -> 980120")
+
+with col2:
+    user_country = st.text_input("Country Code (3 letters)")
+    uploaded_file = st.file_uploader("Upload Passport (Image/PDF)", type=['jpg', 'jpeg', 'png', 'pdf'])
+
+# Verification Trigger
+if st.button("Run Verification", use_container_width=True):
+    if uploaded_file and user_name and user_dob and user_country:
+        # Save uploaded file to a temporary location for PassportEye to read
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp:
+            tmp.write(uploaded_file.getvalue())
+            tmp_path = tmp.name
+
+        with st.spinner("Analyzing Passport..."):
+            is_valid, message, score = verify_logic(tmp_path, user_name, user_dob, user_country)
         
-        # We need detail=0 for easy text joining, but we'll use it to find lines
-        results = reader.readtext(img_bgr, detail=0)
-        return results
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+        # Clean up temp file
+        os.remove(tmp_path)
 
-# --- UI ---
-st.title("🎓 Smart KYS Student Portal")
-
-with st.form("kys_form"):
-    st.subheader("1. Enter Personal Details")
-    col1, col2 = st.columns(2)
-    with col1:
-        name = st.text_input("Full Name (as on Passport)")
-        dob = st.text_input("DOB (YYMMDD)")
-    with col2:
-        country = st.text_input("Country Code (e.g., GBR, USA)")
-        uploaded_file = st.file_uploader("Upload Passport PDF", type=["pdf"])
-
-    submit = st.form_submit_button("Verify Passport")
-
-if submit:
-    if uploaded_file:
-        with st.spinner("Analyzing document structure..."):
-            ocr_lines = process_document(uploaded_file)
-            full_text = " ".join(ocr_lines).upper()
-
-            # STAGE 1: Standard Check (Is it a passport?)
-            is_passport, message = is_valid_passport_standard(ocr_lines)
-            
-            if not is_passport:
-                st.error(f"❌ Verification Blocked: {message}")
-                st.warning("Please upload a valid International Passport. Identity cards or licenses are not accepted.")
-            else:
-                # STAGE 2: Data Matching
-                name_score = fuzz.partial_ratio(name.upper(), full_text)
-                name_match = name_score > 80
-                dob_match = dob in full_text
-                country_match = country.upper() in full_text
-
-                if name_match and dob_match and country_match:
-                    st.success("✅ Standard Passport Verified & Student Data Matched!")
-                else:
-                    st.error("❌ Passport format is correct, but details do not match.")
-                    st.info(f"Check: Name({name_match}), DOB({dob_match}), Country({country_match})")
+        # Display Results
+        if is_valid:
+            st.success(message)
+            st.metric("Match Confidence", f"{score*100:.1f}%")
+            st.balloons()
+        else:
+            st.error(message)
+            st.warning(f"Note: Your name matched with {score*100:.1f}% confidence.")
+    else:
+        st.warning("Please fill in all details and upload your passport.")
