@@ -1,8 +1,7 @@
-streamlit==1.32.0
-easyocr==1.7.1
-rapidfuzz==3.6.1
-pdf2image==1.17.0
-opencv-python-headless==4.9.0.80
-torch
-torchvision
-numpy
+streamlit
+easyocr
+rapidfuzz
+pdf2image
+opencv-python-headless
+torch --index-url https://download.pytorch.org/whl/cpu
+torchvision --index-url https://download.pytorch.org/whl/cpu
